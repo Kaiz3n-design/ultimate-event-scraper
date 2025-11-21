@@ -2,16 +2,15 @@ import os
 import json
 import time
 import re
+import base64
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
+from datetime import datetime, timezone
 
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-
-# Playwright is only imported when needed to keep cold start cheaper
-from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
@@ -19,16 +18,14 @@ MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8765"))
 SCRAPER_USER_AGENT = os.getenv(
     "SCRAPER_USER_AGENT",
-    "Mozilla/5.0 (compatible; EventScraperMCP/1.0; +https://example.com/bot)",
+    "Mozilla/5.0 (compatible; UltimateEventScraperMCP/1.0; +https://github.com/Kaiz3n-design/ultimate-event-scraper)",
 )
 SCRAPER_REQUEST_TIMEOUT = float(os.getenv("SCRAPER_REQUEST_TIMEOUT", "15"))
 
-app = FastMCP()
 
-
-# ---------------------------
-# Helper utilities
-# ---------------------------
+# -------------------------------------------------------------------
+# Helper utilities + schema helpers
+# -------------------------------------------------------------------
 
 def _safe_get_attr(tag, attr_name: str) -> Optional[str]:
     """Safely get an attribute value from a BeautifulSoup tag and convert to string."""
@@ -42,9 +39,57 @@ def _safe_get_attr(tag, attr_name: str) -> Optional[str]:
     return None
 
 
-# ---------------------------
+def ensure_event_shape(ev: Optional[Dict[str, Any]], url: str) -> Dict[str, Any]:
+    """
+    Ensure event dict has all expected keys with reasonable defaults.
+    This keeps the MCP response schema consistent for the LLM.
+    """
+    base = {
+        "source_url": url,
+        "title": None,
+        "description": None,
+        "start": None,
+        "end": None,
+        "location": None,
+        "raw_location": None,
+        "price": None,
+        "currency": None,
+        "organizer": None,
+        "status": None,
+        "event_attendance_mode": None,
+        "images": [],
+        "raw_jsonld": None,
+        "scrape_method": None,
+    }
+    if not ev:
+        return base
+    # Overlay known keys
+    for k in base.keys():
+        if k in ev and ev[k] is not None:
+            base[k] = ev[k]
+    # Preserve any extra debug keys
+    for k, v in ev.items():
+        if k not in base:
+            base[k] = v
+    return base
+
+
+def is_event_rich(ev: Optional[Dict[str, Any]]) -> bool:
+    """
+    Heuristic: a 'rich' event has at least a title AND (start time OR location).
+    """
+    if not ev or not isinstance(ev, dict):
+        return False
+    has_title = bool(ev.get("title"))
+    has_time = bool(ev.get("start"))
+    has_location = bool(ev.get("location"))
+    score = int(has_title) + int(has_time) + int(has_location)
+    return score >= 2
+
+
+# -------------------------------------------------------------------
 # Site Adapter Plugin System
-# ---------------------------
+# -------------------------------------------------------------------
 
 class SiteAdapter(ABC):
     """Base class for site-specific event scrapers."""
@@ -52,12 +97,15 @@ class SiteAdapter(ABC):
     @abstractmethod
     def matches(self, url: str) -> bool:
         """Check if this adapter handles the given URL."""
-        pass
+        ...
 
     @abstractmethod
     def extract_event(self, html: str, url: str) -> Optional[Dict[str, Any]]:
-        """Extract event data from HTML. Return None if extraction fails."""
-        pass
+        """
+        Extract event data from HTML.
+        Should return a full, normalized event dict or None if it can't handle it.
+        """
+        ...
 
 
 class TicketmasterAdapter(SiteAdapter):
@@ -67,29 +115,17 @@ class TicketmasterAdapter(SiteAdapter):
         return "ticketmaster" in url.lower()
 
     def extract_event(self, html: str, url: str) -> Optional[Dict[str, Any]]:
+        base = parse_event_html(html, url)
+        base["scrape_method"] = "ticketmaster_adapter"
+
+        # Optional: override title with more specific selector if available
         soup = BeautifulSoup(html, "lxml")
-
-        # Ticketmaster heavily uses JSON-LD
-        event_data = _parse_event_from_jsonld(html, url)
-        if event_data:
-            return event_data
-
-        # Fallback: look for Ticketmaster-specific patterns
-        title = None
         h1 = soup.find("h1", class_=re.compile("event.*title", re.I))
-        if h1:
-            title = h1.get_text(strip=True)
+        if h1 and h1.get_text(strip=True):
+            base["title"] = h1.get_text(strip=True)
 
-        if not title:
-            og_title = soup.find("meta", property="og:title")
-            if og_title:
-                title = _safe_get_attr(og_title, "content")
-
-        return {
-            "source_url": url,
-            "title": title,
-            "scrape_method": "ticketmaster_adapter",
-        } if title else None
+        base = ensure_event_shape(base, url)
+        return base if is_event_rich(base) else None
 
 
 class EventbriteAdapter(SiteAdapter):
@@ -99,29 +135,16 @@ class EventbriteAdapter(SiteAdapter):
         return "eventbrite" in url.lower()
 
     def extract_event(self, html: str, url: str) -> Optional[Dict[str, Any]]:
+        base = parse_event_html(html, url)
+        base["scrape_method"] = "eventbrite_adapter"
+
         soup = BeautifulSoup(html, "lxml")
-
-        # Eventbrite uses JSON-LD and structured data
-        event_data = _parse_event_from_jsonld(html, url)
-        if event_data:
-            return event_data
-
-        # Fallback: Eventbrite-specific DOM patterns
-        title = None
         header = soup.find("h1", class_=re.compile("eventTitle", re.I))
-        if header:
-            title = header.get_text(strip=True)
+        if header and header.get_text(strip=True):
+            base["title"] = header.get_text(strip=True)
 
-        if not title:
-            meta_title = soup.find("meta", property="og:title")
-            if meta_title:
-                title = _safe_get_attr(meta_title, "content")
-
-        return {
-            "source_url": url,
-            "title": title,
-            "scrape_method": "eventbrite_adapter",
-        } if title else None
+        base = ensure_event_shape(base, url)
+        return base if is_event_rich(base) else None
 
 
 class FacebookEventsAdapter(SiteAdapter):
@@ -133,37 +156,23 @@ class FacebookEventsAdapter(SiteAdapter):
     def extract_event(self, html: str, url: str) -> Optional[Dict[str, Any]]:
         soup = BeautifulSoup(html, "lxml")
 
-        # Facebook events use og: meta tags heavily
         og_title = soup.find("meta", property="og:title")
-        title = _safe_get_attr(og_title, "content") if og_title else None
-
         og_desc = soup.find("meta", property="og:description")
-        description = _safe_get_attr(og_desc, "content") if og_desc else None
+        og_image = soup.find("meta", property="og:image")
+
+        base = ensure_event_shape(None, url)
+        base["title"] = _safe_get_attr(og_title, "content")
+        base["description"] = _safe_get_attr(og_desc, "content")
 
         images = []
-        og_image = soup.find("meta", property="og:image")
         if og_image:
             img_url = _safe_get_attr(og_image, "content")
             if img_url:
-                images = [img_url]
+                images.append(img_url)
+        base["images"] = images
+        base["scrape_method"] = "facebook_adapter"
 
-        return {
-            "source_url": url,
-            "title": title,
-            "description": description,
-            "images": images,
-            "location": None,
-            "start": None,
-            "end": None,
-            "price": None,
-            "currency": None,
-            "organizer": None,
-            "status": None,
-            "event_attendance_mode": None,
-            "raw_location": None,
-            "raw_jsonld": None,
-            "scrape_method": "facebook_adapter",
-        } if title else None
+        return base if is_event_rich(base) else None
 
 
 class MeetupAdapter(SiteAdapter):
@@ -174,25 +183,10 @@ class MeetupAdapter(SiteAdapter):
         return "meetup.com" in url_lower and "/events/" in url_lower
 
     def extract_event(self, html: str, url: str) -> Optional[Dict[str, Any]]:
-        soup = BeautifulSoup(html, "lxml")
-
-        # Meetup uses JSON-LD
-        event_data = _parse_event_from_jsonld(html, url)
-        if event_data:
-            event_data["scrape_method"] = "meetup_adapter"
-            return event_data
-
-        # Fallback: Meetup-specific patterns
-        title = None
-        title_elem = soup.find("h1", class_=re.compile("eventTitle", re.I))
-        if title_elem:
-            title = title_elem.get_text(strip=True)
-
-        return {
-            "source_url": url,
-            "title": title,
-            "scrape_method": "meetup_adapter_fallback",
-        } if title else None
+        base = parse_event_html(html, url)
+        base["scrape_method"] = "meetup_adapter"
+        base = ensure_event_shape(base, url)
+        return base if is_event_rich(base) else None
 
 
 class EventfulAdapter(SiteAdapter):
@@ -202,26 +196,12 @@ class EventfulAdapter(SiteAdapter):
         return "eventful.com" in url.lower()
 
     def extract_event(self, html: str, url: str) -> Optional[Dict[str, Any]]:
-        soup = BeautifulSoup(html, "lxml")
-
-        # Eventful uses schema.org JSON-LD
-        event_data = _parse_event_from_jsonld(html, url)
-        if event_data:
-            event_data["scrape_method"] = "eventful_adapter"
-            return event_data
-
-        # Fallback: look for event title
-        og_title = soup.find("meta", property="og:title")
-        title = _safe_get_attr(og_title, "content") if og_title else None
-
-        return {
-            "source_url": url,
-            "title": title,
-            "scrape_method": "eventful_adapter_fallback",
-        } if title else None
+        base = parse_event_html(html, url)
+        base["scrape_method"] = "eventful_adapter"
+        base = ensure_event_shape(base, url)
+        return base if is_event_rich(base) else None
 
 
-# Registry of all adapters
 SITE_ADAPTERS = [
     TicketmasterAdapter(),
     EventbriteAdapter(),
@@ -232,21 +212,18 @@ SITE_ADAPTERS = [
 
 
 def get_site_adapter(url: str) -> Optional[SiteAdapter]:
-    """Find and return the appropriate adapter for the given URL."""
     for adapter in SITE_ADAPTERS:
         if adapter.matches(url):
             return adapter
     return None
 
 
-# ---------------------------
-# Utility: HTML -> Event data
-# ---------------------------
+# -------------------------------------------------------------------
+# HTML → Event parsing
+# -------------------------------------------------------------------
 
 def _parse_event_from_jsonld(html: str, url: str) -> Optional[Dict[str, Any]]:
-    """
-    Try to parse schema.org Event from JSON-LD script tags.
-    """
+    """Try to parse schema.org Event from JSON-LD script tags."""
     soup = BeautifulSoup(html, "lxml")
 
     for script in soup.find_all("script", type="application/ld+json"):
@@ -255,11 +232,12 @@ def _parse_event_from_jsonld(html: str, url: str) -> Optional[Dict[str, Any]]:
         except Exception:
             continue
 
-        candidates = []
         if isinstance(data, list):
             candidates = data
         elif isinstance(data, dict):
             candidates = [data]
+        else:
+            continue
 
         for obj in candidates:
             if not isinstance(obj, dict):
@@ -271,9 +249,8 @@ def _parse_event_from_jsonld(html: str, url: str) -> Optional[Dict[str, Any]]:
 
 
 def _normalize_event_from_jsonld(obj: Dict[str, Any], url: str) -> Dict[str, Any]:
-    """
-    Normalize a single JSON-LD Event object to our unified schema.
-    """
+    """Normalize a single JSON-LD Event object to our unified schema."""
+
     def safe_get(*keys, default=None):
         cur = obj
         for k in keys:
@@ -328,7 +305,7 @@ def _normalize_event_from_jsonld(obj: Dict[str, Any], url: str) -> Dict[str, Any
     elif isinstance(img, list):
         images = [i for i in img if isinstance(i, str)]
 
-    return {
+    event = {
         "source_url": url,
         "title": obj.get("name"),
         "description": obj.get("description"),
@@ -344,19 +321,18 @@ def _normalize_event_from_jsonld(obj: Dict[str, Any], url: str) -> Dict[str, Any
         "images": images,
         "raw_jsonld": obj,
     }
+    return ensure_event_shape(event, url)
 
 
 def _parse_event_from_dom(html: str, url: str) -> Dict[str, Any]:
-    """
-    Fallback DOM heuristics when JSON-LD is missing or incomplete.
-    """
+    """Fallback DOM heuristics when JSON-LD is missing or incomplete."""
     soup = BeautifulSoup(html, "lxml")
 
     # Title heuristic
     title = None
     og_title = soup.find("meta", property="og:title")
-    if og_title and og_title.get("content"):
-        title = og_title["content"].strip()
+    if og_title:
+        title = _safe_get_attr(og_title, "content")
     if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
     if not title:
@@ -364,30 +340,32 @@ def _parse_event_from_dom(html: str, url: str) -> Dict[str, Any]:
         if h1 and h1.get_text(strip=True):
             title = h1.get_text(strip=True)
 
-    # Description heuristic
+    # Description
     desc = None
     meta_desc = soup.find("meta", attrs={"name": "description"})
-    if meta_desc and meta_desc.get("content"):
-        desc = meta_desc["content"].strip()
+    if meta_desc:
+        content = _safe_get_attr(meta_desc, "content")
+        if content:
+            desc = content
     if not desc:
         og_desc = soup.find("meta", property="og:description")
-        if og_desc and og_desc.get("content"):
-            desc = og_desc["content"].strip()
+        if og_desc:
+            content = _safe_get_attr(og_desc, "content")
+            if content:
+                desc = content
 
-    # Time heuristic: <time> elements with datetime
+    # Time: <time datetime="...">
     start = None
     end = None
     times = soup.find_all("time")
     if times:
-        dt_values = [
-            t.get("datetime") for t in times if t.get("datetime")
-        ]
+        dt_values = [t.get("datetime") for t in times if t.get("datetime")]
         if dt_values:
             start = dt_values[0]
             if len(dt_values) > 1:
                 end = dt_values[1]
 
-    # Location heuristic: look for elements with 'location' or 'venue' in class/id
+    # Location heuristic
     location = None
     candidates = soup.find_all(
         lambda tag: (
@@ -395,8 +373,8 @@ def _parse_event_from_dom(html: str, url: str) -> Dict[str, Any]:
             and any("location" in c.lower() or "venue" in c.lower() for c in tag["class"])
         )
         or (tag.has_attr("id") and (
-            "location" in tag["id"].lower()
-            or "venue" in tag["id"].lower()
+            "location" in str(tag["id"]).lower()
+            or "venue" in str(tag["id"]).lower()
         ))
     )
     for c in candidates:
@@ -415,9 +393,9 @@ def _parse_event_from_dom(html: str, url: str) -> Dict[str, Any]:
             src = img_tag.get("src")
             if src:
                 images.append(src)
-    images = images[:5]  # cap
+    images = images[:5]
 
-    return {
+    event = {
         "source_url": url,
         "title": title,
         "description": desc,
@@ -433,32 +411,28 @@ def _parse_event_from_dom(html: str, url: str) -> Dict[str, Any]:
         "images": images,
         "raw_jsonld": None,
     }
+    return ensure_event_shape(event, url)
 
 
 def parse_event_html(html: str, url: str) -> Dict[str, Any]:
-    """
-    Combined parser: prefer JSON-LD Event, then fall back to DOM heuristics.
-    """
+    """Combined parser: prefer JSON-LD Event, then fall back to DOM heuristics."""
     event = _parse_event_from_jsonld(html, url)
     if event:
-        # Backfill missing fields from DOM heuristics if needed
         dom = _parse_event_from_dom(html, url)
         for key, value in dom.items():
             if event.get(key) in (None, "", []) and value not in (None, "", []):
                 event[key] = value
-        return event
+        return ensure_event_shape(event, url)
     else:
         return _parse_event_from_dom(html, url)
 
 
-# ---------------------------
-# Hybrid fetchers
-# ---------------------------
+# -------------------------------------------------------------------
+# Hybrid fetching (static + Playwright)
+# -------------------------------------------------------------------
 
 def fetch_static_html(url: str) -> Optional[str]:
-    """
-    Try to fetch HTML with plain HTTP first (fast path).
-    """
+    """Try to fetch HTML with plain HTTP first (fast path)."""
     try:
         with httpx.Client(
             timeout=SCRAPER_REQUEST_TIMEOUT,
@@ -467,10 +441,10 @@ def fetch_static_html(url: str) -> Optional[str]:
         ) as client:
             resp = client.get(url)
             if resp.status_code >= 400:
+                print(f"[static] HTTP {resp.status_code} for {url}")
                 return None
             text = resp.text
-            if text and len(text.strip()) > 0:
-                return text
+            return text if text and text.strip() else None
     except Exception as e:
         print(f"[static] Error fetching {url}: {e}")
     return None
@@ -479,14 +453,16 @@ def fetch_static_html(url: str) -> Optional[str]:
 def fetch_dynamic_html_with_playwright(url: str) -> Optional[str]:
     """
     Use Playwright (Chromium) to render JS-heavy pages and return full DOM HTML.
+    Imported lazily to keep cold start cheaper.
     """
     try:
+        from playwright.sync_api import sync_playwright
+
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=SCRAPER_USER_AGENT)
             page.goto(url, wait_until="networkidle", timeout=30000)
-            # Give a little extra time for late JS
-            time.sleep(2)
+            time.sleep(2)  # grace period for late JS
             html = page.content()
             browser.close()
             return html
@@ -498,83 +474,379 @@ def fetch_dynamic_html_with_playwright(url: str) -> Optional[str]:
 def hybrid_fetch(url: str) -> Dict[str, Any]:
     """
     Full hybrid pipeline with site adapters:
-    1. Try site-specific adapter with static HTML
-    2. If adapter fails or no adapter, use generic parser with static HTML
-    3. If result looks too empty, fallback to Playwright + site adapter/generic parser
+      1. Try site-specific adapter with static HTML.
+      2. If adapter fails or no adapter, use generic parser with static HTML.
+      3. If result is not rich, fallback to Playwright + site adapter/generic parser.
     """
+    adapter = get_site_adapter(url)
 
-    def is_event_rich(ev: Dict[str, Any]) -> bool:
-        # Simple heuristic: at least a title and some time OR location.
-        if not ev:
-            return False
-        has_title = bool(ev.get("title"))
-        has_time = bool(ev.get("start"))
-        has_location = bool(ev.get("location"))
-        score = int(has_title) + int(has_time) + int(has_location)
-        return score >= 2
-
-    # 1. Try static fetch with site adapter if available
+    # 1) Static first
     static_html = fetch_static_html(url)
     static_event = None
-    adapter = get_site_adapter(url)
 
     if static_html:
         if adapter:
-            # Use site-specific adapter
             static_event = adapter.extract_event(static_html, url)
 
-        # Fall back to generic parser if adapter failed
-        if not static_event:
-            static_event = parse_event_html(static_html, url)
+        # fallback to generic parser if no adapter or adapter result not rich
+        if not static_event or not is_event_rich(static_event):
+            generic = parse_event_html(static_html, url)
+            if static_event:
+                # backfill adapter result with generic fields
+                for k, v in generic.items():
+                    if static_event.get(k) in (None, "", []) and v not in (None, "", []):
+                        static_event[k] = v
+            else:
+                static_event = generic
+
+    static_event = ensure_event_shape(static_event, url) if static_event else None
 
     if static_event and is_event_rich(static_event):
+        if not static_event.get("scrape_method"):
+            static_event["scrape_method"] = "static"
         return {
             "event": static_event,
-            "scrape_method": static_event.get("scrape_method", "static"),
+            "scrape_method": static_event["scrape_method"],
         }
 
-    # 2. Playwright fallback for JS-heavy content
+    # 2) Playwright fallback
     dynamic_html = fetch_dynamic_html_with_playwright(url)
+    dynamic_event = None
+
     if dynamic_html:
         if adapter:
-            # Try adapter again with rendered HTML
             dynamic_event = adapter.extract_event(dynamic_html, url)
-        else:
-            dynamic_event = None
 
-        # Fall back to generic parser if needed
-        if not dynamic_event:
-            dynamic_event = parse_event_html(dynamic_html, url)
+        if not dynamic_event or not is_event_rich(dynamic_event):
+            generic_dyn = parse_event_html(dynamic_html, url)
+            if dynamic_event:
+                for k, v in generic_dyn.items():
+                    if dynamic_event.get(k) in (None, "", []) and v not in (None, "", []):
+                        dynamic_event[k] = v
+            else:
+                dynamic_event = generic_dyn
 
+    dynamic_event = ensure_event_shape(dynamic_event, url) if dynamic_event else None
+
+    if dynamic_event and is_event_rich(dynamic_event):
+        if not dynamic_event.get("scrape_method"):
+            dynamic_event["scrape_method"] = "playwright"
         return {
             "event": dynamic_event,
-            "scrape_method": dynamic_event.get("scrape_method") if dynamic_event else "playwright_empty",
+            "scrape_method": dynamic_event["scrape_method"],
         }
 
+    # 3) Total failure: return best-effort + error field
+    best = dynamic_event or static_event
+    best = ensure_event_shape(best, url) if best else ensure_event_shape(None, url)
+    best["scrape_method"] = "failed"
     return {
-        "event": static_event or None,
+        "event": best,
         "scrape_method": "failed",
+        "error": "Could not extract a rich event; check the URL or page structure.",
     }
 
 
-# ---------------------------
-# MCP Tool
-# ---------------------------
+# -------------------------------------------------------------------
+# Screenshot, PDF, Media, and Advanced Features
+# -------------------------------------------------------------------
 
-@app.tool(name="scrapeEventPage", description="Scrape event details from an event webpage URL.")
-def scrape_event_page(url: str) -> Dict[str, Any]:
+def capture_event_screenshot(url: str) -> Optional[Dict[str, Any]]:
     """
-    Hybrid event scraper. Given a URL, tries static HTML first and then
-    falls back to Playwright rendering to extract event details.
+    Capture a screenshot of the event page using Playwright.
+    Returns base64-encoded PNG for embedding in responses.
     """
-    result = hybrid_fetch(url)
-    return result
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=SCRAPER_USER_AGENT)
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            time.sleep(1)  # Grace period for rendering
+            screenshot_bytes = page.screenshot(type="png")
+            browser.close()
+
+            # Encode to base64 for transport
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+            return {
+                "url": url,
+                "screenshot_base64": screenshot_b64,
+                "format": "png",
+            }
+    except Exception as e:
+        print(f"[screenshot] Error capturing screenshot for {url}: {e}")
+        return {"url": url, "error": str(e)}
 
 
-# ---------------------------
-# MCP WebSocket entrypoint
-# ---------------------------
+def generate_event_pdf(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Generate a PDF brochure of the event page using Playwright.
+    Returns base64-encoded PDF.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
 
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=SCRAPER_USER_AGENT)
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            time.sleep(1)
+            pdf_bytes = page.pdf(format="A4")
+            browser.close()
+
+            pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+            return {
+                "url": url,
+                "pdf_base64": pdf_b64,
+                "format": "pdf",
+            }
+    except Exception as e:
+        print(f"[pdf] Error generating PDF for {url}: {e}")
+        return {"url": url, "error": str(e)}
+
+
+def extract_event_media(html: str, url: str) -> Dict[str, Any]:
+    """
+    Extract all media (images, videos) from the event page.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    images = []
+    videos = []
+
+    # Extract images
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        alt = img.get("alt", "")
+        if src:
+            images.append({"url": src, "alt": alt})
+
+    # Extract video sources
+    for video in soup.find_all("video"):
+        for source in video.find_all("source"):
+            src = source.get("src")
+            video_type = source.get("type", "")
+            if src:
+                videos.append({"url": src, "type": video_type})
+
+    # Extract YouTube embeds from iframes
+    for iframe in soup.find_all("iframe"):
+        src = iframe.get("src")
+        if src and ("youtube.com" in src or "youtu.be" in src):
+            videos.append({"url": src, "type": "youtube"})
+
+    # Extract from og:image meta tags
+    for meta in soup.find_all("meta", property="og:image"):
+        content = meta.get("content")
+        if content:
+            images.append({"url": content, "source": "og:image"})
+
+    return {
+        "url": url,
+        "images": images[:20],  # Limit to first 20
+        "videos": videos[:10],  # Limit to first 10
+        "total_images": len(images),
+        "total_videos": len(videos),
+    }
+
+
+def check_ticket_availability(url: str) -> Dict[str, Any]:
+    """
+    Check ticket availability and pricing information from event page.
+    Uses Playwright to handle dynamic content.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=SCRAPER_USER_AGENT)
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            time.sleep(2)  # Wait for JS to render prices/availability
+
+            # Execute JavaScript to check for ticket/button states
+            ticket_info = page.evaluate(
+                """
+                () => {
+                    const info = {
+                        has_register_button: !!document.querySelector('[onclick*="register"], button[aria-label*="register"], button:contains("Register")'),
+                        has_buy_button: !!document.querySelector('a[href*="tickets"], button:contains("Buy"), button:contains("Get Tickets")'),
+                        has_sold_out: !!document.body.innerText.match(/sold[\\s-]*out|no[\\s-]*tickets|unavailable/i),
+                        price_text: (document.body.innerText.match(/\\$[\\d,]+\\.?\\d*|free|complimentary/i) || ['N/A'])[0],
+                        form_inputs: Array.from(document.querySelectorAll('input[type="email"], input[type="text"], input[placeholder*="email"], input[placeholder*="name"]')).length,
+                    };
+                    return info;
+                }
+                """
+            )
+
+            browser.close()
+
+            return {
+                "url": url,
+                "ticket_info": ticket_info,
+                "status": "sold_out" if ticket_info["has_sold_out"] else "available",
+            }
+    except Exception as e:
+        print(f"[availability] Error checking availability for {url}: {e}")
+        return {"url": url, "error": str(e)}
+
+
+def generate_ics_calendar(event_data: Dict[str, Any]) -> Optional[str]:
+    """
+    Generate an ICS (iCalendar) file from event data.
+    Returns ICS content as string.
+    """
+    try:
+        title = (event_data.get("title") or "Event").replace("\n", " ")
+        start = event_data.get("start")
+        end = event_data.get("end")
+        location = (event_data.get("location") or "").replace("\n", " ")
+        description = (event_data.get("description") or "").replace("\n", "\\n")
+        url = event_data.get("source_url", "")
+
+        # Basic ICS format (simplified, no timezone conversion)
+        ics = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Event Scraper MCP//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+BEGIN:VEVENT
+UID:{url}
+DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}
+DTSTART:{start if start else 'N/A'}
+DTEND:{end if end else 'N/A'}
+SUMMARY:{title}
+DESCRIPTION:{description}
+LOCATION:{location}
+URL:{url}
+END:VEVENT
+END:VCALENDAR"""
+
+        return ics
+    except Exception as e:
+        print(f"[ics] Error generating ICS: {e}")
+        return None
+
+
+# -------------------------------------------------------------------
+# FastMCP server + tool
+# -------------------------------------------------------------------
+
+def make_mcp_server() -> FastMCP:
+    """
+    Factory that creates the FastMCP server.
+    This matches the pattern in the Modal example:
+    mcp = make_mcp_server()
+    mcp_app = mcp.http_app(transport="streamable-http", stateless_http=True)
+    """
+    mcp = FastMCP(
+        name="Ultimate Event Scraper MCP",
+        instructions=(
+            "A server that scrapes event details from arbitrary event URLs using "
+            "a hybrid static+Playwright scraper and site-specific adapters."
+        ),
+    )
+
+    @mcp.tool()
+    async def scrapeEventPage(url: str) -> Dict[str, Any]:
+        """
+        Scrape event details from an event webpage URL.
+        Returns a consistent JSON object with fields like title, start, end, location, etc.
+        """
+        try:
+            return hybrid_fetch(url)
+        except Exception as e:
+            print(f"[scrapeEventPage] Unexpected error for {url}: {e}")
+            return {
+                "event": ensure_event_shape(None, url),
+                "scrape_method": "error",
+                "error": str(e),
+            }
+
+    @mcp.tool()
+    async def captureEventScreenshot(url: str) -> Dict[str, Any]:
+        """
+        Capture a screenshot of the event page for visual preview.
+        Returns base64-encoded PNG image data.
+        """
+        try:
+            result = capture_event_screenshot(url)
+            return result or {"url": url, "error": "Screenshot capture failed"}
+        except Exception as e:
+            print(f"[captureEventScreenshot] Error for {url}: {e}")
+            return {"url": url, "error": str(e)}
+
+    @mcp.tool()
+    async def generateEventPDF(url: str) -> Dict[str, Any]:
+        """
+        Generate a PDF brochure of the event page.
+        Returns base64-encoded PDF data.
+        """
+        try:
+            result = generate_event_pdf(url)
+            return result or {"url": url, "error": "PDF generation failed"}
+        except Exception as e:
+            print(f"[generateEventPDF] Error for {url}: {e}")
+            return {"url": url, "error": str(e)}
+
+    @mcp.tool()
+    async def extractEventMedia(url: str) -> Dict[str, Any]:
+        """
+        Extract all media (images, videos) from the event page.
+        Returns lists of image and video URLs found on the page.
+        """
+        try:
+            # Fetch HTML first
+            html = fetch_static_html(url) or fetch_dynamic_html_with_playwright(url)
+            if not html:
+                return {"url": url, "error": "Could not fetch page content"}
+            return extract_event_media(html, url)
+        except Exception as e:
+            print(f"[extractEventMedia] Error for {url}: {e}")
+            return {"url": url, "error": str(e)}
+
+    @mcp.tool()
+    async def checkTicketAvailability(url: str) -> Dict[str, Any]:
+        """
+        Check ticket availability and pricing information.
+        Detects buy buttons, sold-out status, and pricing information.
+        """
+        try:
+            return check_ticket_availability(url)
+        except Exception as e:
+            print(f"[checkTicketAvailability] Error for {url}: {e}")
+            return {"url": url, "error": str(e)}
+
+    @mcp.tool()
+    async def generateEventCalendar(event_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate an ICS (iCalendar) file from event data.
+        Can be imported into calendar applications.
+        Requires event_data with fields like title, start, end, location, description.
+        """
+        try:
+            ics_content = generate_ics_calendar(event_data)
+            if ics_content:
+                return {
+                    "ics_content": ics_content,
+                    "format": "ics",
+                    "success": True,
+                }
+            else:
+                return {"error": "Failed to generate ICS content"}
+        except Exception as e:
+            print(f"[generateEventCalendar] Error: {e}")
+            return {"error": str(e)}
+
+    return mcp
+
+
+# For local testing only (not used on Modal's stateless HTTP deployment)
 if __name__ == "__main__":
+    mcp = make_mcp_server()
     print(f"Starting Event Scraper MCP server on http://{MCP_HOST}:{MCP_PORT}/mcp")
-    app.run(transport="http", host=MCP_HOST, port=MCP_PORT)
+    # You can choose "http" or "streamable-http" here; for MCP inspector,
+    # "streamable-http" is generally what you'll want.
+    mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)

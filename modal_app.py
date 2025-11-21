@@ -4,7 +4,9 @@ import modal
 image = (
     modal.Image.debian_slim()
     .pip_install(
+        "fastapi",
         "fastmcp",
+        "pydantic",
         "httpx",
         "beautifulsoup4",
         "lxml",
@@ -20,26 +22,24 @@ image = (
 
 app = modal.App("event-scraper-mcp")
 
-
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_dotenv()],  # loads your .env into env vars
+    secrets=[modal.Secret.from_dotenv()],
     keep_warm=1,
 )
 @modal.asgi_app()
-def run():
+def web():
     import sys
-    # Add the app directory to path so we can import event_scraper_mcp_server
+
     sys.path.insert(0, "/root/app")
+    from event_scraper_mcp_server import make_mcp_server
 
-    import event_scraper_mcp_server
+    # Create the MCP server instance
+    mcp = make_mcp_server()
 
-    # Return the HTTP ASGI application from the FastMCP instance
-    # FastMCP.http_app() is a method that returns the Starlette/ASGI application
-    return event_scraper_mcp_server.app.http_app()
-
-
-@app.local_entrypoint()
-def main():
-    # Run locally using Modal's CLI
-    run.remote()
+    # Return the MCP HTTP app directly without FastAPI wrapper
+    # This allows proper HTTP/JSON-RPC exposure for tool discovery
+    return mcp.http_app(
+        transport="streamable-http",
+        stateless_http=True,
+    )
